@@ -216,6 +216,7 @@ function normalizeConfigValue(key, value) {
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "allowNonSolQuote",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
   const stringKeys = new Set([
@@ -389,6 +390,7 @@ const toolMap = {
       stopLossPct: ["management", "stopLossPct"],
       takeProfitPct: ["management", "takeProfitPct"],
       takeProfitFeePct: ["management", "takeProfitPct"],
+      nonSolTakeProfitPct: ["management", "nonSolTakeProfitPct"],
       trailingTakeProfit: ["management", "trailingTakeProfit"],
       trailingTriggerPct: ["management", "trailingTriggerPct"],
       trailingDropPct: ["management", "trailingDropPct"],
@@ -440,6 +442,7 @@ const toolMap = {
       publicApiKey: ["api", "publicApiKey"],
       agentMeridianApiUrl: ["api", "url"],
       lpAgentRelayEnabled: ["api", "lpAgentRelayEnabled"],
+      allowNonSolQuote: ["api", "allowNonSolQuote"],
       // pnl fetcher / poller
       pnlSource: ["pnl", "source", ["pnlSource"]],
       pnlRpcUrl: ["pnl", "rpcUrl", ["pnlRpcUrl"]],
@@ -695,6 +698,11 @@ export async function executeTool(name, args) {
             result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
             if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
           }
+        }
+        // Safety sweep: non-SOL-quoted positions should exit as SOL via the relay zap-out,
+        // but if any quote token (USDC/etc) is left behind, sweep it back to SOL too.
+        if (!args.skip_swap && result.quote_is_sol === false && result.quote_mint && result.quote_mint !== result.base_mint) {
+          await swapBaseToSolWithRetry(result.quote_mint, "quote after close");
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim");

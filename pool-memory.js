@@ -68,6 +68,34 @@ function setPoolCooldown(entry, hours, reason) {
   return cooldownUntil;
 }
 
+/**
+ * Put a pool on cooldown by address (creates a minimal entry if none exists).
+ * Pool-only — does NOT set base_mint_cooldown_until. Used to skip pools that just
+ * failed to deploy for a transient/technical reason (e.g. uninitialized bin arrays).
+ */
+export function cooldownPool(poolAddress, hours, reason, { name, base_mint } = {}) {
+  if (!poolAddress) return null;
+  const db = load();
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: name || poolAddress.slice(0, 8),
+      base_mint: base_mint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+  const until = setPoolCooldown(db[poolAddress], hours, reason);
+  save(db);
+  return until;
+}
+
 function setBaseMintCooldown(db, baseMint, hours, reason) {
   if (!baseMint) return null;
   const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();

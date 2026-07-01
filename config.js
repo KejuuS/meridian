@@ -118,6 +118,9 @@ export const config = {
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
+    // Higher take-profit for non-SOL-quoted pools (reached via relay zap-in/out) so the
+    // extra SOL→quote→SOL swap drag (~1.2–2%) is offset before we lock a scalp win.
+    nonSolTakeProfitPct:   u.nonSolTakeProfitPct   ?? 7,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
@@ -189,6 +192,9 @@ export const config = {
     url: nonEmptyString(u.agentMeridianApiUrl, process.env.AGENT_MERIDIAN_API_URL, DEFAULT_AGENT_MERIDIAN_API_URL),
     publicApiKey: nonEmptyString(u.publicApiKey, process.env.PUBLIC_API_KEY, DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY),
     lpAgentRelayEnabled: u.lpAgentRelayEnabled ?? false,
+    // Master switch: allow deploying into non-SOL-quoted pools (USDC/etc) via relay
+    // zap-in/zap-out (swap SOL→quote on entry, quote→SOL on close). Off by default.
+    allowNonSolQuote: u.allowNonSolQuote ?? false,
   },
 
   // ─── PnL fetcher / poller (public infra: RPC + Meteora deposits + Jupiter) ──

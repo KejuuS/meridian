@@ -24,7 +24,7 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown, cooldownPool } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -293,6 +293,18 @@ function formatSolFee(value) {
   return Number.isFinite(number) ? number.toFixed(8).replace(/0+$/, "").replace(/\.$/, "") : "unknown";
 }
 
+// After a deploy is blocked because the range needs Meteora bin-array initialization
+// (non-refundable rent), cooldown the pool for this long so screening stops re-picking it.
+const BIN_INIT_COOLDOWN_HOURS = 4;
+
+function isBinInitFailure(msg) {
+  const t = String(msg || "").toLowerCase();
+  return t.includes("bin-array initialization") ||
+    t.includes("initializebinarray") ||
+    t.includes("initialization rent") ||
+    t.includes("bin-array bitmap");
+}
+
 async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId) {
   const {
     getBinArrayKeysCoverage,
@@ -496,6 +508,18 @@ export async function deployPosition({
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
   }
+  // Quote-side routing: SOL-quoted pools use the cheap direct SDK deposit (wrapped SOL as
+  // tokenY). Non-SOL-quoted pools (USDC/etc) require swapping SOL→quote first, which the
+  // relay zap-in handles — so they are routed through the relay path below. Gated by
+  // config.api.allowNonSolQuote so the feature is opt-in.
+  const quoteMint = pool.lbPair.tokenYMint.toString();
+  const quoteIsSol = quoteMint === config.tokens.SOL;
+  if (!quoteIsSol && !config.api.allowNonSolQuote) {
+    log("deploy", `Pool ${pool_address.slice(0, 8)} is quoted in non-SOL token ${quoteMint.slice(0, 8)} — blocked (allowNonSolQuote=false)`);
+    return { success: false, error: "Non-SOL quote pool disabled. This pool is quoted in a non-SOL token; enable allowNonSolQuote to deploy it via relay zap-in." };
+  }
+  // Non-SOL pools MUST go through the relay (it performs the SOL→quote swap + deposit).
+  const useRelayForDeploy = !quoteIsSol ? true : shouldUseLpAgentRelayForDeploy();
   const activeBin = await pool.getActiveBin();
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
@@ -607,7 +631,15 @@ export async function deployPosition({
     );
   }
 
-  await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+  try {
+    await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+  } catch (e) {
+    if (isBinInitFailure(e.message)) {
+      cooldownPool(pool_address, BIN_INIT_COOLDOWN_HOURS, "bin-array init required", { name: pool_name, base_mint: baseMint });
+      log("deploy", `Cooldown ${pool_address.slice(0, 8)} for ${BIN_INIT_COOLDOWN_HOURS}h — range needs bin-array init`);
+    }
+    return { success: false, error: e.message };
+  }
 
   const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());
@@ -628,7 +660,7 @@ export async function deployPosition({
     totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
   }
 
-  if (shouldUseLpAgentRelayForDeploy()) {
+  if (useRelayForDeploy) {
     try {
       const wallet = getWallet();
       log(
@@ -712,6 +744,8 @@ export async function deployPosition({
           entry_tvl,
           entry_volume,
           entry_holders,
+          quote_mint: quoteMint,
+          quote_is_sol: quoteIsSol,
         });
       }
 
@@ -763,6 +797,10 @@ export async function deployPosition({
       };
     } catch (error) {
       log("deploy_error", `Relay deploy failed: ${error.message}`);
+      if (isBinInitFailure(error.message)) {
+        cooldownPool(pool_address, BIN_INIT_COOLDOWN_HOURS, "bin-array init required (relay)", { name: pool_name, base_mint: baseMint });
+        log("deploy", `Cooldown ${pool_address.slice(0, 8)} for ${BIN_INIT_COOLDOWN_HOURS}h — relay tx needs bin-array init`);
+      }
       return { success: false, error: error.message };
     }
   }
@@ -854,6 +892,8 @@ export async function deployPosition({
       entry_tvl,
       entry_volume,
       entry_holders,
+      quote_mint: quoteMint,
+      quote_is_sol: quoteIsSol,
     });
 
     appendDecision({
@@ -1508,7 +1548,10 @@ export async function closePosition({ position_address, reason }) {
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
-    if (shouldUseLpAgentRelay()) {
+    // Non-SOL-quoted positions were opened via relay zap-in and MUST close via zap-out
+    // (which swaps the quote token back to SOL), even if the global relay toggle is off.
+    const forceRelayForQuote = tracked?.quote_is_sol === false;
+    if (shouldUseLpAgentRelay() || forceRelayForQuote) {
       let relaySubmitted = false;
       try {
       const pool = await getPool(poolAddress);
@@ -1727,6 +1770,8 @@ export async function closePosition({ position_address, reason }) {
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
           base_mint: closeBaseMint,
+          quote_mint: tracked?.quote_mint || pool.lbPair.tokenYMint.toString(),
+          quote_is_sol: tracked?.quote_is_sol ?? (pool.lbPair.tokenYMint.toString() === config.tokens.SOL),
         };
       }
 
@@ -1752,6 +1797,8 @@ export async function closePosition({ position_address, reason }) {
         close_txs: closeTxHashes,
         txs: txHashes,
         base_mint: livePosition?.base_mint || null,
+        quote_mint: tracked?.quote_mint || pool.lbPair.tokenYMint.toString(),
+        quote_is_sol: tracked?.quote_is_sol ?? (pool.lbPair.tokenYMint.toString() === config.tokens.SOL),
       };
       } catch (relayError) {
         if (relaySubmitted) throw relayError;

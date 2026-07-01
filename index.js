@@ -417,7 +417,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Load active strategy
     const activeStrategy = getActiveStrategy();
     const deployStrategy = config.strategy.strategy;
-    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`
+    const nonSolTp = config.management.nonSolTakeProfitPct ?? 7;
+    const quoteRule = config.api.allowNonSolQuote
+      ? ` | quote: PREFER SOL-quoted pools (cheapest — no swap). A non-SOL/USDC-quoted pool is allowed ONLY if it clearly beats the best SOL candidate (e.g. fee/aTVL ≥ ~1.5× the best SOL pool, or no SOL candidate qualifies) — it costs ~1.5% extra swap and auto-uses a higher ${nonSolTp}% take-profit. Deposit is still amount_y with amount_x=0 (relay swaps SOL→quote).`
+      : ` | deposit: SOL only (amount_y, amount_x=0)`;
+    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change)${quoteRule}`
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
@@ -914,7 +918,12 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  // Non-SOL-quoted positions use a higher TP threshold to offset the SOL→quote→SOL swap
+  // drag before locking a scalp win. quote_is_sol is persisted on the tracked position.
+  const tpThreshold = tracked?.quote_is_sol === false
+    ? (managementConfig.nonSolTakeProfitPct ?? managementConfig.takeProfitPct)
+    : managementConfig.takeProfitPct;
+  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= tpThreshold) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (

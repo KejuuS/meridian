@@ -719,6 +719,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   return {
     candidates: eligible,
+    total_eligible: eligible.length,
     total_screened: pools.length,
     filtered_examples: filteredOut.slice(0, 3),
   };

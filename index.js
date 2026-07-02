@@ -25,7 +25,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal, getOpenDegenCount } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -34,6 +34,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { ensureBaseline, recordNavSnapshot } from "./treasury.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -53,6 +54,7 @@ if (isMain) {
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
+  ensureBaseline().catch((error) => log("treasury_warn", `Baseline init failed: ${error.message}`));
 }
 
 const TP_PCT = config.management.takeProfitPct;
@@ -94,6 +96,20 @@ let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
+
+let _lastNavSnapshotAt = 0; // throttle treasury NAV snapshots to ~1h
+const NAV_SNAPSHOT_INTERVAL_MS = 60 * 60 * 1000;
+/** Record a treasury NAV snapshot at most once per hour. Fire-and-forget, never throws. */
+async function maybeSnapshotNav(reason = "cycle") {
+  if (Date.now() - _lastNavSnapshotAt < NAV_SNAPSHOT_INTERVAL_MS) return;
+  _lastNavSnapshotAt = Date.now(); // set before await so concurrent cycles don't double-fire
+  try {
+    const nav = await recordNavSnapshot();
+    log("treasury", `NAV snapshot (${reason}): $${nav.nav_usd} (${nav.nav_sol} SOL) — ${nav.open_count} open`);
+  } catch (e) {
+    log("treasury_warn", `NAV snapshot failed: ${e.message}`);
+  }
+}
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
@@ -223,6 +239,7 @@ export async function runManagementCycle({ silent = false } = {}) {
   _managementBusy = true;
   timers.managementLastRun = Date.now();
   log("cron", "Starting management cycle");
+  void maybeSnapshotNav("management"); // hourly-throttled treasury equity-curve point
   let mgmtReport = null;
   let positions = [];
   let liveMessage = null;
@@ -421,7 +438,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const quoteRule = config.api.allowNonSolQuote
       ? ` | quote: PREFER SOL-quoted pools (cheapest — no swap). A non-SOL/USDC-quoted pool is allowed ONLY if it clearly beats the best SOL candidate (e.g. fee/aTVL ≥ ~1.5× the best SOL pool, or no SOL candidate qualifies) — it costs ~1.5% extra swap and auto-uses a higher ${nonSolTp}% take-profit. Deposit is still amount_y with amount_x=0 (relay swaps SOL→quote).`
       : ` | deposit: SOL only (amount_y, amount_x=0)`;
-    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change)${quoteRule}`
+    const degenThreshold = config.opportunity.minScore;
+    const openDegen = getOpenDegenCount();
+    const slotRule = `\nSLOT-FILL: Never leave a slot empty when a worthwhile candidate exists — full capital utilization is preferred. PREFER "normal" tempo pools (degen_score < ${degenThreshold}). Choose a "DEGEN" tempo pool (degen_score >= ${degenThreshold}) ONLY if it clearly beats the best normal candidate, or no normal candidate qualifies. Currently holding ${openDegen} degen position(s).`;
+    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change)${quoteRule}${slotRule}`
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
@@ -538,8 +558,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
         : null;
 
+      const ds = degenScore(pool, config.opportunity);
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
+        `  tempo: ${ds >= config.opportunity.minScore ? "DEGEN" : "normal"} (degen_score=${Math.round(ds)})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
@@ -727,6 +749,9 @@ Summarize the current portfolio health, total fees earned, and performance of al
   // management-interval cooldown gate that used to swallow rule hits).
   const pnlPollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
+  // Take-profit (RULE_2) requires more sustained confirmation than SL/OOR so a brief
+  // green blip doesn't fire a close that settles negative during the tx window.
+  const tpConfirmTicks = Math.max(confirmTicks, Number(config.pnl.tpConfirmTicks ?? 4));
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
@@ -745,8 +770,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
         if (exit) { signal = exit.action; reason = exit.reason; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
 
-        // Require N consecutive confirming ticks before acting.
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        // Require N consecutive confirming ticks before acting. Take-profit (rule 2)
+        // needs more sustained confirmation than stop-loss/OOR (which stay fast).
+        const effTicks = (rule === 2) ? tpConfirmTicks : confirmTicks;
+        const { fire } = registerExitSignal(p.position, signal, effTicks);
         if (!signal || !fire) continue;
 
         log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);

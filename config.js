@@ -142,6 +142,12 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    // Dynamic entry-strategy selection: pick spot vs bid_ask by pool volatility unless
+    // an explicit strategy is passed to deploy_position. See chooseEntryStrategy().
+    dynamicEntry:         u.dynamicEntry ?? true,
+    volStrategyThreshold: Number(u.volStrategyThreshold ?? 3.5), // vol ≥ → high, < → low
+    highVolStrategy:      nonEmptyString(u.highVolStrategy, "bid_ask"),
+    lowVolStrategy:       nonEmptyString(u.lowVolStrategy, "spot"),
   },
 
   // ─── Scheduling ─────────────────────────
@@ -210,6 +216,10 @@ export const config = {
     // At a 3s poll cadence, 2 ticks ≈ 3-6s — filters single-tick noise without the
     // old fixed 15s setTimeout recheck.
     confirmTicks: Number(u.pnlConfirmTicks ?? 2),
+    // Take-profit needs MORE sustained confirmation than stop-loss/OOR: a brief green
+    // blip on a volatile token would otherwise fire a close that settles negative during
+    // the ~7s tx window. 4 ticks ≈ 12s of sustained profit. SL/OOR keep confirmTicks (fast).
+    tpConfirmTicks: Number(u.pnlTpConfirmTicks ?? 4),
   },
 
   // ─── Opportunity poller (catches strong pools between screening cycles) ──
@@ -291,6 +301,25 @@ export function computeDeployAmount(walletSol) {
   const dynamic    = deployable * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
+}
+
+/**
+ * Pick the DLMM entry strategy dynamically from pool volatility.
+ * High volatility → bid_ask (liquidity at the edges → fee turnover near price + deep-dip
+ * capture); ranging/low volatility → spot (even coverage). Falls back to the configured
+ * default when dynamicEntry is off or volatility is unusable.
+ *
+ * @param {number|null} volatility - Pool volatility at deploy time.
+ * @returns {"spot"|"bid_ask"|"curve"} strategy id
+ */
+export function chooseEntryStrategy(volatility) {
+  const s = config.strategy;
+  if (!s.dynamicEntry) return s.strategy;
+  const v = Number(volatility);
+  if (!Number.isFinite(v) || v <= 0) return s.strategy; // unusable feed → safe default
+  return v >= (s.volStrategyThreshold ?? 3.5)
+    ? (s.highVolStrategy || "bid_ask")
+    : (s.lowVolStrategy || "spot");
 }
 
 /**

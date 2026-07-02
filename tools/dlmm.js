@@ -11,7 +11,7 @@ import {
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
-import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW, chooseEntryStrategy } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -484,9 +484,10 @@ export async function deployPosition({
   entry_tvl,
   entry_volume,
   entry_holders,
+  degen_score,
 }) {
   pool_address = normalizeMint(pool_address);
-  const activeStrategy = strategy || config.strategy.strategy;
+  const isDegenPosition = Number(degen_score ?? 0) >= config.opportunity.minScore;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
   const parsedVolatility = volatility == null ? null : Number(volatility);
@@ -495,6 +496,11 @@ export async function deployPosition({
   if (volatility != null && (normalizedVolatility == null || normalizedVolatility <= 0)) {
     throw new Error(`Invalid volatility ${volatility} — refusing deploy because the volatility feed is unusable.`);
   }
+
+  // Dynamic entry strategy: pick spot vs bid_ask from volatility unless an explicit
+  // strategy was passed (user/LLM override always wins).
+  const activeStrategy = strategy || chooseEntryStrategy(normalizedVolatility);
+  log("deploy", `Strategy: ${activeStrategy}${strategy ? " (explicit)" : ` (dynamic, vol=${normalizedVolatility ?? "?"})`}`);
 
   if (isPoolOnCooldown(pool_address)) {
     log("deploy", `Pool ${pool_address.slice(0, 8)} is on cooldown — skipping`);
@@ -746,6 +752,8 @@ export async function deployPosition({
           entry_holders,
           quote_mint: quoteMint,
           quote_is_sol: quoteIsSol,
+          degen_score: degen_score ?? null,
+          is_degen: isDegenPosition,
         });
       }
 
@@ -894,6 +902,8 @@ export async function deployPosition({
       entry_holders,
       quote_mint: quoteMint,
       quote_is_sol: quoteIsSol,
+      degen_score: degen_score ?? null,
+      is_degen: isDegenPosition,
     });
 
     appendDecision({
@@ -1943,6 +1953,10 @@ export async function closePosition({ position_address, reason }) {
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
+      // SOL-denominated figures — the real currency for a SOL-compounding strategy.
+      let initialSol = tracked.amount_sol || 0;
+      let finalValueSol = 0;
+      let feesSol = 0;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -1957,6 +1971,9 @@ export async function closePosition({ position_address, reason }) {
               const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
               const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
               const nextFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+              const nextInitialSol = parseFloat(posEntry.allTimeDeposits?.total?.sol || 0);
+              const nextFinalValueSol = parseFloat(posEntry.allTimeWithdrawals?.total?.sol || 0);
+              const nextFeesSol = parseFloat(posEntry.allTimeFees?.total?.sol || 0);
 
               if (shouldRejectClosedPnl(nextPnlPct, reason || tracked?.close_reason)) {
                 log("close_warn", `Rejected unsettled closed PnL for ${position_address.slice(0, 8)} on attempt ${attempt + 1}/6: ${nextPnlPct.toFixed(2)}%`);
@@ -1967,6 +1984,9 @@ export async function closePosition({ position_address, reason }) {
                 finalValueUsd = nextFinalValueUsd;
                 initialUsd    = nextInitialUsd;
                 feesUsd       = nextFeesUsd;
+                initialSol    = nextInitialSol || initialSol;
+                finalValueSol = nextFinalValueSol;
+                feesSol       = nextFeesSol;
                 log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)} USD, deposited=${initialUsd.toFixed(2)} USD`);
                 break;
               }
@@ -1988,6 +2008,12 @@ export async function closePosition({ position_address, reason }) {
           pnlPct        = cachedPos.pnl_pct   ?? 0;
           feesUsd       = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
           initialUsd    = tracked.initial_value_usd || 0;
+          if (config.management.solMode) {
+            // In solMode the cached *_usd fields hold SOL-denominated values.
+            finalValueSol = cachedPos.total_value_usd ?? 0;
+            feesSol       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+            initialSol    = tracked.amount_sol || initialSol;
+          }
           if (initialUsd > 0) {
             // Keep fallback internally consistent using USD-only cached metrics.
             finalValueUsd = Math.max(0, initialUsd + pnlTrueUsd - feesUsd);
@@ -2035,6 +2061,12 @@ export async function closePosition({ position_address, reason }) {
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
+        // SOL-denominated (primary metric when solMode) — pnl already computed above.
+        pnl_sol: config.management.solMode ? pnlUsd : null,
+        pnl_pct_sol: config.management.solMode ? pnlPct : null,
+        deposit_sol: initialSol,
+        final_value_sol: finalValueSol,
+        fees_earned_sol: feesSol,
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",

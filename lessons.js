@@ -33,6 +33,16 @@ const PERFORMANCE_SIGNAL_FIELDS = [
 ];
 const MAX_MANUAL_LESSON_LENGTH = 400;
 
+// ─── Learning thresholds (recalibrated for current small-position scale) ───
+// Original defaults preserved in comments — they were tuned for larger positions
+// where losses regularly breached -5%. On current data (n=52) pnl_pct never
+// breaches -5%, so the old cuts produced 0 AVOID/FAILED lessons and left the
+// loser-based branches of evolveThresholds permanently dead.
+const GOOD_PNL_PCT         = 2;    // default: 5   — strong directional win (~p85; catches ~8 winners)
+const GOOD_FEE_YIELD_PCT   = 1.5;  // default: 2   — fee-farming win (~p75 fee yield)
+const BAD_PNL_PCT          = -0.5; // default: -5  — clearly-bad tail (~p10; ~6 trades → enables AVOID/FAILED)
+const EVOLVE_LOSER_PNL_PCT = -1;   // default: -5  — stricter (touches real screening config; ~2 losers)
+
 function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
   if (text == null) return null;
   const cleaned = String(text)
@@ -96,6 +106,8 @@ function buildSignalSnapshot(perf) {
  */
 export async function recordPerformance(perf) {
   const data = load();
+  const { config } = await import("./config.js");
+  const solMode = !!config.management?.solMode;
 
   // Guard against unit-mixed records where a SOL-sized final value is
   // accidentally written into a USD field (e.g. final_value_usd = 2 for a 2 SOL close).
@@ -113,10 +125,33 @@ export async function recordPerformance(perf) {
     return;
   }
 
-  const pnl_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
-  const pnl_pct = perf.initial_value_usd > 0
-    ? (pnl_usd / perf.initial_value_usd) * 100
+  // USD figures — always available from the closed-PnL API.
+  const pnl_true_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
+  const pct_usd = perf.initial_value_usd > 0
+    ? (pnl_true_usd / perf.initial_value_usd) * 100
     : 0;
+
+  // SOL figures — supplied by the close path when solMode. This is the currency that
+  // matters for a SOL-compounding strategy (USD PnL is flattered by SOL price moves).
+  const depositSol = Number(perf.deposit_sol ?? perf.amount_sol);
+  let pnl_sol = null;
+  let pct_sol = null;
+  if (Number.isFinite(perf.pnl_sol)) {
+    pnl_sol = perf.pnl_sol;
+    pct_sol = Number.isFinite(perf.pnl_pct_sol)
+      ? perf.pnl_pct_sol
+      : (depositSol > 0 ? (pnl_sol / depositSol) * 100 : 0);
+  } else if (Number.isFinite(perf.final_value_sol) && depositSol > 0) {
+    pnl_sol = (perf.final_value_sol + (Number(perf.fees_earned_sol) || 0)) - depositSol;
+    pct_sol = (pnl_sol / depositSol) * 100;
+  }
+
+  // Primary metric follows solMode. Convention: pnl_usd/pnl_pct hold the SOL value when
+  // solMode is on (matches getMyPositions/pnl.js); pnl_true_usd is always USD.
+  const useSol = solMode && pnl_sol != null;
+  const pnl_usd = useSol ? pnl_sol : pnl_true_usd;
+  const pnl_pct = useSol ? pct_sol : pct_usd;
+
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
@@ -137,8 +172,12 @@ export async function recordPerformance(perf) {
   const entry = {
     ...perf,
     signal_snapshot: signalSnapshot,
-    pnl_usd: Math.round(pnl_usd * 100) / 100,
+    // pnl_usd holds SOL when solMode (tiny values → keep 6dp; USD keeps 2dp).
+    pnl_usd: useSol ? Math.round(pnl_usd * 1e6) / 1e6 : Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
+    pnl_true_usd: Math.round(pnl_true_usd * 100) / 100,
+    pnl_sol: pnl_sol != null ? Math.round(pnl_sol * 1e6) / 1e6 : null,
+    denom: useSol ? "SOL" : "USD",
     range_efficiency: Math.round(range_efficiency * 10) / 10,
     recorded_at: new Date().toISOString(),
   };
@@ -223,10 +262,10 @@ function derivLesson(perf) {
     : 0;
 
   // Categorize outcome
-  const outcome = perf.pnl_pct >= 5 ? "good"
-    : (perf.pnl_pct >= 0 && feeYieldPct >= 2) ? "good"
+  const outcome = perf.pnl_pct >= GOOD_PNL_PCT ? "good"                          // was: >= 5
+    : (perf.pnl_pct >= 0 && feeYieldPct >= GOOD_FEE_YIELD_PCT) ? "good"          // was: >= 2
     : perf.pnl_pct >= 0 ? "neutral"
-    : perf.pnl_pct >= -5 ? "poor"
+    : perf.pnl_pct >= BAD_PNL_PCT ? "poor"                                       // was: >= -5
     : "bad";
 
   if (outcome === "neutral") return null; // nothing interesting to learn
@@ -280,7 +319,7 @@ function derivLesson(perf) {
     (perf.fees_earned_usd || 0) >= 3 ||
     perf.pnl_pct >= 3;
   const negativeEvidence =
-    perf.pnl_pct <= -5 ||
+    perf.pnl_pct <= BAD_PNL_PCT ||   // was -5
     perf.range_efficiency <= 30 ||
     closeReasonText.includes("out of range") ||
     closeReasonText.includes("oor") ||
@@ -334,7 +373,7 @@ export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
   const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+  const losers  = perfData.filter((p) => p.pnl_pct < EVOLVE_LOSER_PNL_PCT);   // was: < -5
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
@@ -726,6 +765,27 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
 }
 
 /**
+ * Sum realized pnl_usd for closes recorded at/after the given ISO timestamp.
+ * Used by treasury reconciliation so a "captured_now" baseline only counts
+ * realized PnL that occurred AFTER the baseline (historical PnL is already
+ * baked into the captured NAV and must not be double-counted).
+ *
+ * @param {string|null} sinceIso - ISO timestamp; null = all-time.
+ * @param {Object} [opts]
+ * @param {string} [opts.denom] - If set (e.g. "SOL"), only sum records tagged with that
+ *   denomination. Prevents mixing USD-era records into a SOL reconciliation.
+ */
+export function getRealizedPnlSince(sinceIso = null, { denom = null } = {}) {
+  const data = load();
+  const rows = (data.performance || []).filter((r) =>
+    (!sinceIso || (r.recorded_at || "") >= sinceIso) &&
+    (!denom || r.denom === denom));
+  // pnl_usd holds SOL when solMode — keep 6dp so tiny SOL sums aren't rounded to zero.
+  const usd = rows.reduce((s, r) => s + (r.pnl_usd || 0), 0);
+  return { realized_usd: Math.round(usd * 1e6) / 1e6, count: rows.length };
+}
+
+/**
  * Get performance stats summary.
  */
 export function getPerformanceSummary() {
@@ -741,7 +801,7 @@ export function getPerformanceSummary() {
 
   return {
     total_positions_closed: p.length,
-    total_pnl_usd: Math.round(totalPnl * 100) / 100,
+    total_pnl_usd: Math.round(totalPnl * 1e6) / 1e6,  // holds SOL sum when solMode (6dp)
     avg_pnl_pct: Math.round(avgPnlPct * 100) / 100,
     avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
     win_rate_pct: Math.round((wins / p.length) * 100),

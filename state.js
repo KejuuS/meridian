@@ -75,6 +75,8 @@ export function trackPosition({
   entry_holders = null,
   quote_mint = null,
   quote_is_sol = true,
+  degen_score = null,
+  is_degen = false,
 }) {
   const state = load();
   state.positions[position] = {
@@ -98,6 +100,8 @@ export function trackPosition({
     entry_holders,
     quote_mint,
     quote_is_sol,
+    degen_score,
+    is_degen,
     signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
@@ -119,6 +123,15 @@ export function trackPosition({
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
   log("state", `Tracked new position: ${position} in pool ${pool}`);
+}
+
+/**
+ * Count open (not-closed) positions classified as degen at deploy time.
+ * Surfaced to the screener prompt as context for the "prefer normal, degen fallback" rule.
+ */
+export function getOpenDegenCount() {
+  const state = load();
+  return Object.values(state.positions || {}).filter((p) => p && !p.closed && p.is_degen === true).length;
 }
 
 /**
@@ -464,6 +477,7 @@ export function setLastBriefingDate() {
  * Marks any local open positions as closed if they are not in the on-chain list.
  */
 const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
+const SYNC_MISSING_CONFIRM = 2;   // require N consecutive "missing" syncs before auto-closing
 
 export function syncOpenPositions(active_addresses) {
   const state = load();
@@ -472,20 +486,34 @@ export function syncOpenPositions(active_addresses) {
 
   for (const posId in state.positions) {
     const pos = state.positions[posId];
-    if (pos.closed || activeSet.has(posId)) continue;
+    if (pos.closed) continue;
 
-    // Grace period: newly deployed positions may not be indexed yet
+    // Present on-chain → clear any pending missing-counter.
+    if (activeSet.has(posId)) {
+      if (pos._missingSyncs) { pos._missingSyncs = 0; changed = true; }
+      continue;
+    }
+
+    // Grace period: newly deployed positions may not be indexed yet.
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
     if (Date.now() - deployedAt < SYNC_GRACE_MS) {
       log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
       continue;
     }
 
+    // Missing on-chain — require consecutive confirmations so a single fetch glitch
+    // (RPC hiccup / partial API response) can't false-close a still-live position.
+    pos._missingSyncs = (pos._missingSyncs || 0) + 1;
+    changed = true;
+    if (pos._missingSyncs < SYNC_MISSING_CONFIRM) {
+      log("state", `Position ${posId} missing on-chain (${pos._missingSyncs}/${SYNC_MISSING_CONFIRM}) — deferring auto-close`);
+      continue;
+    }
+
     pos.closed = true;
     pos.closed_at = new Date().toISOString();
-    pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
-    changed = true;
-    log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
+    pos.notes.push(`Auto-closed during state sync (not found on-chain, confirmed ${pos._missingSyncs}x)`);
+    log("state", `Position ${posId} auto-closed (missing from on-chain data, ${pos._missingSyncs}x)`);
   }
 
   if (changed) save(state);

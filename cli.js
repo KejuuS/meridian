@@ -200,6 +200,12 @@ Shows all closed position performance history with summary stats.
 Output: { summary: { total_positions_closed, total_pnl_usd, avg_pnl_pct, win_rate_pct, total_lessons }, count, positions: [...] }
 \`\`\`
 
+### meridian reconcile [--set-deposit <sol>]
+Reconciles recorded PnL against real wallet NAV (SOL + dust + open positions). Optionally set the true initial deposit (SOL) for full-history accuracy.
+\`\`\`
+Output: { current: {nav_usd, nav_sol, wallet_usd, positions_usd, dust_usd, open_count}, baseline, realized_pnl_usd, unrealized_pnl_usd, expected_nav_usd, drift_usd, drift_sol }
+\`\`\`
+
 ### meridian discord-signals [clear]
 Shows pending Discord signal queue from the discord-listener process.
 \`\`\`
@@ -252,6 +258,7 @@ const { values: flags } = parseArgs({
     "skip-swap":  { type: "boolean" },
     "dry-run":    { type: "boolean" },
     "silent":     { type: "boolean" },
+    "set-deposit": { type: "string" },
     limit:        { type: "string" },
   },
   allowPositionals: true,
@@ -589,6 +596,19 @@ switch (subcommand) {
     } else {
       die(`Unknown blacklist subcommand: ${sub2}. Use: add, list`);
     }
+    break;
+  }
+
+  // ── reconcile ────────────────────────────────────────────────────
+  case "reconcile": {
+    const { reconcile, setInitialDeposit, formatReconcile } = await import("./treasury.js");
+    if (flags["set-deposit"] !== undefined) {
+      const res = await setInitialDeposit(parseFloat(flags["set-deposit"]));
+      if (res.error) die(res.error);
+    }
+    const r = await reconcile();
+    process.stderr.write("\n" + formatReconcile(r) + "\n\n"); // human-readable to stderr
+    out(r); // JSON to stdout (agent-native)
     break;
   }
 

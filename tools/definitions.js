@@ -167,7 +167,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           strategy: {
             type: "string",
             enum: ["bid_ask", "spot"],
-            description: "DLMM strategy type. If user specifies, use exactly what they said. Otherwise omit — the system default from config.strategy.strategy will be used automatically."
+            description: "DLMM strategy type. If the user specifies one, use exactly that. Otherwise OMIT — the system picks spot vs bid_ask automatically from pool volatility (high vol → bid_ask, ranging → spot)."
           },
           bins_below: {
             type: "number",
@@ -1105,6 +1105,21 @@ Blacklisted tokens are filtered BEFORE the LLM even sees pool candidates.`,
     function: {
       name: "list_blocked_deployers",
       description: "List all blocked deployer wallets.",
+      parameters: {
+        type: "object",
+        properties: {}
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "reconcile_treasury",
+      description: `Verify recorded PnL against the wallet's real net asset value (NAV).
+NAV = liquid wallet holdings (SOL + dust tokens + USDC) + value of open DLMM positions.
+Use when the user asks to verify/audit their balance, "how much did I actually make", or whether
+the tracked PnL matches the real wallet. Read-only. Returns current NAV, baseline, realized +
+unrealized PnL, and the drift (≈ gas + rent + dust + state-sync error).`,
       parameters: {
         type: "object",
         properties: {}

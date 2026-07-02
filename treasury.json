@@ -194,6 +194,28 @@
       "open_count": 2,
       "cum_realized_pnl_usd": 2.06,
       "sol_price": 77.51
+    },
+    {
+      "ts": "2026-07-02T02:25:01.187Z",
+      "nav_usd": 23.98,
+      "nav_sol": 0.3078,
+      "wallet_usd": 15.13,
+      "positions_usd": 8.85,
+      "dust_usd": 0,
+      "open_count": 1,
+      "cum_realized_pnl_usd": 2.05,
+      "sol_price": 77.9
+    },
+    {
+      "ts": "2026-07-02T03:25:01.867Z",
+      "nav_usd": 19.33,
+      "nav_sol": 0.247,
+      "wallet_usd": 1.35,
+      "positions_usd": 17.98,
+      "dust_usd": 0,
+      "open_count": 2,
+      "cum_realized_pnl_usd": 2.06,
+      "sol_price": 78.27
     }
   ]
 }
